@@ -25,9 +25,12 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
+#include <assert.h>
+// #include <time.h>
+// #include <unistd.h>
+#ifndef UNIT_TEST
 #include <libsigrok/libsigrok.h>
+#endif
 #include "libsigrok-internal.h"
 #include "protocol-rp.h"
 
@@ -37,94 +40,87 @@
 //==================================================================
 // Reset:
 //   Host: '*'
-//   Probe: Interrupt doing anything and: '*$#{PCH.v1}'  
+//   Probe: Interrupt doing anything and: '*PCHv1.' + non-null byte for no replay
 //
-// SampleRate:
-//   Host: 'R' Hz-rate-decimal-9-digits '#'
-//   Probe: ' :'
+// Start sampling:
+//   Host: 'A>' Hz-rate-hexa-8-digits
+//   Probe: 'BoB'<null> <Block-number-low-byte> <Block-number-byte2> <Block-number-byte3> <block-number-high-byte> repeat 4096 * (8-bit-data)
 //
-// Acquisition:
-//   Host: 'A>'
-//   Probe: '/^' repeat (8-bit-data * 4096) ';' Block-number-low-byte block-number-high-byte '.'
-//
-// Stop Acq:
-//   Host: 'S$'
-//   Probe: '=|'
+// Stop sampling:
+//   Host: '|S' <last-bock-id-unsigned-hexa-8-digits>
+//   Probe: 'AllDone'<null> only after last BoB have been sent
 
-static const unsigned ACK_LENGTH = 8;
-static const uint8_t * const RESET_ANNOUNCE    = (const uint8_t *)"*PCHv1.";  // followed by no replay random uint8_t
-static const char *    const SAMPLE_RATE_CMD   = "R%09llu#";
-static const uint8_t *       SAMPLE_RATE_ACK   = (const uint8_t *)"RATEACK";  //-- including ending null char
-static const unsigned CMD_LENGTH = 2;
-static const char *    const START_ACQ_CMD     = "A>";
-static const uint8_t *       START_ACQ_ACK     = (const uint8_t *)"STARTAC";  //-- including ending null char
-static const char *    const STOP_ACQ_CMD      = "=|";
-static const uint8_t * const STOP_ACQ_ACK      = (const uint8_t *)"ENDACK.";  //-- including ending null char
-static const unsigned EOB_LENGTH = 4;
-static const uint8_t *       EOB_MARKER        = (const uint8_t *)"EOB";  //-- including ending null char & preceeded by buffer number in little endian
+static const uint8_t * const RESET_ANNOUNCE    = (const uint8_t *)"*PCHv1.";  //-- followed by no replay random uint8_t
+static const uint8_t * const STOP_SAMP_ACK     = (const uint8_t *)"AllDone";  //-- including ending null char
+static const uint8_t * const BOB_MARKER        = (const uint8_t *)"BoB";      //-- including ending null char & followed by 32-bit buffer number in little endian
 
-static uint8_t  noreplay_random = 0;
+static const unsigned        CMD_LENGTH        = 2;
+static const char *    const START_SAMP_CMD    = "A>";                        //-- followed by rate indicated in hertz by 8 following hexa characters (up to 4GHz+)
+static const char *    const STOP_SAMP_CMD     = "|S";                        //-- followed by 8 char hex to specify the number of the block after last one to send
+
+
+static uint8_t  noreplay_value = 'A';
 
 static int send_serial_str(struct sr_serial_dev_inst *serial, const char *str)
 {
-	int len = strlen(str);
-	if ((len > 15) || (len < 1)) {
-		sr_err("ERROR: Serial string len %d invalid ", len);
-		return SR_ERR;
-	}
+    int len = strlen(str);
+    if ((len > 15) || (len < 1)) {
+        sr_err("ERROR: Serial string len %d invalid ", len);
+        return SR_ERR;
+    }
 
-	/* 100ms timeout. With USB CDC serial we can't define the timeout based
-	 * on link rate, so just pick something large as we shouldn't normally
-	 * see them */
-	if (serial_write_blocking(serial, str, len, 100) != len) {
-		sr_err("ERROR: Serial str write failed");
-		return SR_ERR;
-	}
+    /* 100ms timeout. With USB CDC serial we can't define the timeout based
+     * on link rate, so just pick something large as we shouldn't normally
+     * see them */
+    if (serial_write_blocking(serial, str, len, 100) != len) {
+        sr_err("ERROR: Serial str write failed");
+        return SR_ERR;
+    }
 
-	return SR_OK;
+    return SR_OK;
 }
 
 static int send_serial_char(struct sr_serial_dev_inst *serial, char ch)
 {
-	char buf[1];
-	buf[0] = ch;
+    char buf[1];
+    buf[0] = ch;
 
-	if (serial_write_blocking(serial, buf, 1, 100) != 1) {	/* 100ms */
-		sr_err("ERROR: Serial char write failed");
-		return SR_ERR;
-	}
+    if (serial_write_blocking(serial, buf, 1, 100) != 1) {	/* 100ms */
+        sr_err("ERROR: Serial char write failed");
+        return SR_ERR;
+    }
 
-	return SR_OK;
+    return SR_OK;
 }
 
-/* Issue a command that expects a string return that is less than 30 characters.
- * Returns the length of string */
-static int send_serial_w_resp(struct sr_serial_dev_inst *serial, const char *str, uint8_t *resp, size_t cnt)
-{
-	int num_read, i;
-	send_serial_str(serial, str);
+// /* Issue a command that expects a string return that is equal to cnt characters maximum.
+//  * Returns the actual length of string */
+// static int send_serial_w_resp(struct sr_serial_dev_inst *serial, const char *str, uint8_t *resp, size_t cnt)
+// {
+//     int num_read, i;
+//     send_serial_str(serial, str);
 
-	/* Using the serial_read_blocking function when reading a response of
-	 * unknown length requires a long worst case timeout to always be taken.
-	 * So, instead loop waiting for a first byte, and then a final small delay
-	 * for the rest. */
-	for (i = 0; i < 1000; i++) {	/* wait up to 1 second in ms increments */
-		num_read = serial_read_blocking(serial, resp, cnt, 1);
-		if (num_read > 0)
-			break;
-	}
+//     /* Using the serial_read_blocking function when reading a response of
+//      * unknown length requires a long worst case timeout to always be taken.
+//      * So, instead loop waiting for a first byte, and then a final small delay
+//      * for the rest. */
+//     for (i = 0; i < 1000; i++) {	/* wait up to 1 second in ms increments */
+//         num_read = serial_read_blocking(serial, resp, cnt, 1);
+//         if (num_read > 0)
+//             break;
+//     }
 
-	/* Since the serial port is USB CDC we can't calculate timeouts based on
-	 * baud rate but even if the response is split between two USB transfers,
-	 * 10ms should be plenty. */
-	num_read += serial_read_blocking(serial, resp + num_read, cnt - num_read,
-		10);
-	if (num_read < 1) {
-		sr_err("ERROR: Serial_w_resp failed (%d).", num_read);
-		return -1;
-	} else
-		return num_read;
-}
+//     /* Since the serial port is USB CDC we can't calculate timeouts based on
+//      * baud rate but even if the response is split between two USB transfers,
+//      * 10ms should be plenty. */
+//     num_read += serial_read_blocking(serial, resp + num_read, cnt - num_read,
+//         10);
+//     if (num_read < 1) {
+//         sr_err("ERROR: Serial_w_resp failed (%d).", num_read);
+//         return -1;
+//     } else
+//         return num_read;
+// }
 
 
 /**
@@ -135,170 +131,184 @@ static int send_serial_w_resp(struct sr_serial_dev_inst *serial, const char *str
  * @param serialcomm 
  * @return gboolean indicate success
  */
-
 gboolean reset_rp_device(struct sr_serial_dev_inst *serial)
 {
-	const int BUF_LENGTH = 32;
-	time_t cur_time;
+    int len;
+    unsigned keep = 0;
+    uint8_t  buf[MARKER_SIZE];
+    gboolean result = FALSE;
+    int trials = 0;
+    do {
+        // Send Reset command
+        noreplay_value++; // Change the value each time it is sent so response to one reset can be paired only with right query
+        send_serial_char(serial, '*');
+        send_serial_char(serial, noreplay_value);
+        g_usleep(10000);
+        for(;;) {
+            sr_warn("Drain reads");
+            // Waiting for corresponding RESET_ANNOUNCE
+            // Request to fill buffer. 100ms should be sufficient
+            len = serial_read_blocking(serial, buf + keep, MARKER_SIZE - keep, 100);
+            if (len)
+            {
+                // We got a response from probe
+                len += keep;
+                if (len == MARKER_SIZE) {
+                    // And length is sufficient to contain the announce
+                    // So check whether it start with the first announce character
+                    uint8_t *match_start = memchr(buf, *RESET_ANNOUNCE, MARKER_SIZE);
+                    if (match_start) {
+                        // OK we have found the start of the announce
+                        if (match_start == buf) {
+                            // Good, it is actually at the start of the received buffer
+                            if ((memcmp(RESET_ANNOUNCE, buf, MARKER_SIZE-1) == 0) && (buf[MARKER_SIZE-1] == noreplay_value)) {
+                                // Bingo, the full annouce matches, as well as the noreply byte
+                                result = TRUE; // Reset is OK
+                                break;         // We are done
+                            }
+                            // Buffer does not match, drop first announce character but keep rest of buffer
+                            // (the expected announce may start somewhere inside the remaining bytes)
+                            keep = (MARKER_SIZE - 1);
+                            ++match_start;
+                        }
+                        else {
+                            // Ooops. Start of announce is in the middle of the buffer
+                            // Keep only data from the announce start
+                            keep = (MARKER_SIZE - 1) - (match_start - buf) + 1;
+                        }
+                        assert(keep > 0); 
+                        // A part of the buffer needs to be kept. 
+                        // Move it at beginning of the buffer
+                        memmove(buf, match_start, keep);
+                    }
+                    else {
+                        // The announce does not start in this buffer
+                        // So drop it completly
+                        keep = 0;
+                    }
+                    sr_dbg("Dropping %d serial data bytes", MARKER_SIZE-keep);
+                }
+                else {
+                    // The buffer is not completly filled
+                    // so keep it entirely to get remaining bytes
+                    keep = len;
+                }
+            }
+            else {
+                // Nothing has been read in 100ms
+                // The probe seems not responding
+                // Just in case it would not have understood the reset
+                // Try to send it again
+                break;
+            }
+        };
+        // This trial is completed (successfully or not)
+        ++trials;
+    }
+    // Retry a new time if we have not been successfull or if retry limit has been reached
+    while (!result && (trials < 5));
+    sr_warn("Drain reads done");
+    return result;
+}
 
-	if (noreplay_random == 0) {
-		noreplay_random = (uint8_t)time(&cur_time);
-	}
-	noreplay_random ^= 0x5500AA11;
-	noreplay_random ^= noreplay_random >> 9;
-	noreplay_random ^= noreplay_random << 7;
 
-	int len;
-	unsigned keep = 0;
-	char buf[BUF_LENGTH];
-	gboolean result = FALSE;
-	uint8_t random_byte = (uint8_t)noreplay_random;
 
-	send_serial_char(serial, '*');
-	send_serial_char(serial, random_byte);
-	g_usleep(10000);
-	do {
-		sr_warn("Drain reads");
-		//-- Waiting for RESET_ANNOUNCE
-		len = serial_read_blocking(serial, buf + keep, BUF_LENGTH - keep, 100);
-		if (len)
-		{
-			char * match_start = buf;
 
-			result = FALSE;
-			if (keep == 0) {
-				//-- No match yet, try to find one
-				match_start = memchr(buf, *RESET_ANNOUNCE, len);
-				if (match_start != NULL) {
-					//-- match beginning is found keep next chars
-					keep = len - (match_start - buf);
-					len = 0; //-- All useful read data are kept. no more data
-				}
-				else {
-					// Leave non null len to indicate that
-					// though we have not found expected data
-					// we have at least received data
-					sr_dbg("Dropping %d serial data", len);
-				}
-			}
+static const char *COMMAND_FORMAT = "%s%08X";
+static const int   FULL_COMMAND_LENGTH = CMD_LENGTH+8+1; // The command length + length of 8 hex digit of 32bit value  + null Terminator
 
-			if (keep > 0) {
-				keep += len; //-- Add new read data to what we were keeping
-				if (keep >= ACK_LENGTH) {
-					//-- We have enough data to check device annouce
-					if ((memcmp(match_start, RESET_ANNOUNCE, ACK_LENGTH-1) == 0) 
-					 && ((uint8_t)(match_start[ACK_LENGTH-1]) == random_byte)) {
-						//-- This is matching. Normally there should be nothing after that
-						keep -= ACK_LENGTH;
-						result = (keep == 0);
-						match_start += ACK_LENGTH; //-- next match if any may not start before this point
-					}
-					else {
-						//-- Try to find a match at next char
-						match_start++;
-						keep--;
-					}
-					if (!result && (match_start != buf)) {
-						memmove(buf, match_start, keep);
-					}
-				}
-			}
-		}
-		else {
-			//-- No data received before the timeout
-			//-- Forget previous received data and exit loop
-			keep = 0;
-		}
-	} while ((len > 0) || (keep > 0));
-	sr_warn("Drain reads done");
-	return result;
+/**
+ * @brief Send command
+ * 
+ * @param sdi The device instance data
+ * @param command The 2 character command
+ * @param value the command 32bit parameter value
+ * 
+ * @return SR_PRIV 
+ */
+static gboolean send_rp_command(const struct sr_dev_inst *sdi, const char *command, int32_t value) {
+    char tmpstr[FULL_COMMAND_LENGTH];
+
+    snprintf(tmpstr, FULL_COMMAND_LENGTH, COMMAND_FORMAT, command, value);
+    if (send_serial_str(sdi->conn, tmpstr) != SR_OK) {
+        sr_err("Failed to send probe %s acquisition command", tmpstr);
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 
 /**
- * @brief Send sample rate and wait for device acknowledgement
+ * @brief Send sample start command
  * 
  * @param sdi 
  * @return SR_PRIV 
  */
-gboolean send_rp_sample_rate(const struct sr_dev_inst *sdi) {
-	struct dev_context * const devc = sdi->priv;
-	char tmpstr[16];
-	int  num_read;
-
-	snprintf(tmpstr, sizeof(tmpstr), SAMPLE_RATE_CMD, devc->sample_rate);
-	num_read = send_serial_w_resp(sdi->conn, tmpstr, devc->d_data_buf, strlen(tmpstr));
-	if (num_read != sizeof(SAMPLE_RATE_ACK)) {
-		sr_err("Failed to read probe sample rate command acknowledgement");
-		return FALSE;
-	}
-	if (memcmp(devc->d_data_buf, SAMPLE_RATE_ACK, ACK_LENGTH) != 0) {
-		sr_err("Invalid probe answer to sample rate command");
-		return FALSE;
-	}
-	return TRUE;
-}
-
-
-
 gboolean send_rp_start_capture(const struct sr_dev_inst *sdi) {
-	struct dev_context * const devc = sdi->priv;
-	unsigned  num_read;
-
-	num_read = send_serial_w_resp(sdi->conn, START_ACQ_CMD, devc->d_data_buf, ACK_LENGTH);
-	if (num_read != ACK_LENGTH) {
-		sr_err("Failed to read probe start acquisition command acknowledgement");
-		return FALSE;
-	}
-	if (memcmp(devc->d_data_buf, START_ACQ_ACK, ACK_LENGTH) != 0) {
-		sr_err("Invalid probe answer to start acquisition command");
-		return FALSE;
-	}
-	return TRUE;
+    struct dev_context * const devc = sdi->priv;
+    return send_rp_command(sdi, START_SAMP_CMD, devc->sample_rate);
 }
 
 
-bufferstatus_t read_rp_data_block (struct sr_dev_inst *sdi) {
-	struct dev_context * const devc = sdi->priv;
-	uint32_t buf_number;
+bufferstatus_t read_rp_data_block (const struct sr_dev_inst *sdi) {
+    bufferstatus_t result = INVALID_DATA;
 
-	/* Fill the buffer, note the end may have partial slices */
-	int bytes_rem = SERIAL_BUFFER_SIZE - devc->wrptr;
+    struct dev_context * const devc = sdi->priv;
 
-	devc->wrptr += serial_read_blocking(sdi->conn, devc->d_data_buf + devc->wrptr, bytes_rem, 10);
+    /* Fill the buffer with a marker or a data block */
+    uint32_t buffer_size = (devc->data_expected) ? DATA_BLOCK_SIZE : MARKER_SIZE;
+    //  The buffer may contain partial slice
+    int bytes_rem = buffer_size - devc->wrptr;
 
-	if (devc->wrptr == SERIAL_BUFFER_SIZE) {
-		if (memcmp(devc->d_data_buf + SERIAL_BUFFER_SIZE - EOB_LENGTH, EOB_MARKER, EOB_LENGTH) != 0) {
-			sr_err("ERROR: Sample buffer badly formatted");
-			return INVALID_DATA;
-		}
-		//-- little endlian
-		buf_number = ((uint32_t)(devc->d_data_buf[SERIAL_BUFFER_SIZE-1]) << 24) + 
-						((uint32_t)(devc->d_data_buf[SERIAL_BUFFER_SIZE-2]) << 16) + 
-						((uint32_t)(devc->d_data_buf[SERIAL_BUFFER_SIZE-3]) << 8) + 
-						devc->d_data_buf[SERIAL_BUFFER_SIZE-1];
-		if (buf_number != devc->buffer_number) {
-			sr_err("ERROR: buffer number is not correct: found=%08x, expected=%08x", buf_number, devc->buffer_number);
-			return INVALID_DATA;
-		}
-		devc->buffer_number++;
-		devc->wrptr = 0;
-		return BUFFER_RECEIVED;
-	}
-	else if ((devc->wrptr == ACK_LENGTH)
-	 && (memcmp(devc->d_data_buf, STOP_ACQ_ACK, ACK_LENGTH) == 0)) {
-		devc->wrptr = 0;
-		return ACQ_COMPLETED;
-	}
-	return PARTIAL_DATA;
+    devc->wrptr += serial_read_blocking(sdi->conn, devc->d_data_buf + devc->wrptr, bytes_rem, 10);
+
+    if (devc->wrptr < buffer_size) {
+        result = PARTIAL_DATA;
+    }
+
+    else {
+        devc->wrptr = 0;  // Buffer is full get ready for next data
+
+        if (devc->data_expected) {
+            devc->data_expected = FALSE;
+            sr_err("buffer %08x received", devc->buffer_number);
+            devc->buffer_number++;
+            result = BUFFER_RECEIVED;
+        }
+        
+        else if (memcmp(devc->d_data_buf, BOB_MARKER, BOB_LENGTH) == 0) {
+            uint32_t buf_number;
+            //-- Buffer number is sent as little endian by probe
+            buf_number = (devc->d_data_buf[BOB_LENGTH+3] << 24) + 
+                            (devc->d_data_buf[BOB_LENGTH+2] << 16) + 
+                            (devc->d_data_buf[BOB_LENGTH+1] << 8) + 
+                            devc->d_data_buf[BOB_LENGTH];
+            if (buf_number != devc->buffer_number) {
+                sr_err("ERROR: buffer number is not correct: found=%08x, expected=%08x", buf_number, devc->buffer_number);
+            }
+            else {
+                // The data block header is correct. Data is now expected.
+                devc->data_expected = TRUE;
+                result = PARTIAL_DATA;
+            }
+        }
+        else if (memcmp(devc->d_data_buf, STOP_SAMP_ACK, MARKER_SIZE) == 0) {
+            result = ACQ_COMPLETED;
+        }
+    }
+    return result;
 }
 
-gboolean send_rp_stop_capture(struct sr_dev_inst *sdi) {
-	int  num_sent = serial_write_blocking(sdi->conn, STOP_ACQ_CMD, CMD_LENGTH, 30);
-	if (num_sent != sizeof(STOP_ACQ_CMD)) {
-		sr_err("Failed to send probe stop acquisition command");
-		return FALSE;
-	}
-	return TRUE;
+
+gboolean send_rp_stop_capture(const struct sr_dev_inst *sdi, uint32_t block_limit) {
+    gboolean result = send_rp_command(sdi, STOP_SAMP_CMD, block_limit);
+    if (! result) {
+        sr_err("Failed sending stop device stream");
+    }
+    else {
+        std_session_send_df_trigger(sdi);
+    }
+    return result;
 }
 

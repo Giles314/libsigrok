@@ -171,11 +171,11 @@ void process_D4(struct sr_dev_inst *sdi, struct dev_context *d)
 			/* Any other character ends parsing - it could be a frame error or a
 			 * start of the final byte cnt */
 			if (cbyte == '$') {
-				sr_info("D4 Data stream stops with cbyte %d char %c rdidx %d cnt %lu",
+				sr_info("D4 Data stream stops with cbyte %d char %c rdidx %d cnt %llu",
 					cbyte, cbyte, d->ser_rdptr, d->byte_cnt);
 				d->rxstate = RX_STOPPED;
 			} else {
-				sr_err("D4 Data stream aborts with cbyte %d char %c rdidx %d cnt %lu",
+				sr_err("D4 Data stream aborts with cbyte %d char %c rdidx %d cnt %llu",
 					cbyte, cbyte, d->ser_rdptr, d->byte_cnt);
 				d->rxstate = RX_ABORT;
 			}
@@ -237,11 +237,11 @@ void process_slice(struct sr_dev_inst *sdi, struct dev_context *devc)
 		cbyte = devc->buffer[slice_bytes - 1];
 		slice_bytes--;	/* Don't process the ending character */
 		if (cbyte == '$') {
-			sr_info("Data stream stops with cbyte %d char %c rdidx %d sbytes %d cnt %lu",
+			sr_info("Data stream stops with cbyte %d char %c rdidx %d sbytes %d cnt %llu",
 				cbyte, cbyte, devc->ser_rdptr, slice_bytes, devc->byte_cnt);
 			devc->rxstate = RX_STOPPED;
 		} else {
-			sr_err("Data stream aborts with cbyte %d char %c rdidx %d sbytes %d cnt %lu",
+			sr_err("Data stream aborts with cbyte %d char %c rdidx %d sbytes %d cnt %llu",
 				cbyte, cbyte, devc->ser_rdptr, slice_bytes, devc->byte_cnt);
 			devc->rxstate = RX_ABORT;
 		}
@@ -482,7 +482,7 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 			num_samples = num_slices;
 		}
 		if (num_samples > 0) {
-			sr_spew("Process_group sending %lu post trig samples dsb %d",
+			sr_spew("Process_group sending %llu post trig samples dsb %d",
 				num_samples, devc->dig_sample_bytes);
 			if (devc->num_d_channels) {
 				packet.type = SR_DF_LOGIC;
@@ -543,7 +543,7 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 			/* The soft trigger logic issues the trigger and sends packets for
 			 * all logic data that was pretrigger so only send what is left */
 			if (num_samples > 0) {
-				sr_dbg("Sending post trigger logical remainder of %lu",
+				sr_dbg("Sending post trigger logical remainder of %llu",
 					num_samples);
 				logic.length = num_samples * devc->dig_sample_bytes;
 				logic.unitsize = devc->dig_sample_bytes;
@@ -779,10 +779,10 @@ SR_PRIV int raspberrypi_pico_receive(int fd, int revents, void *cb_data)
 				devc->buffer[i] = 0;
 				uint64_t rxbytecnt;
 				rxbytecnt = atol((char*)&(devc->buffer[1]));
-				sr_dbg("Byte_cnt check device cnt %lu host cnt %lu",
+				sr_dbg("Byte_cnt check device cnt %llu host cnt %llu",
 					rxbytecnt, devc->byte_cnt);
 				if (rxbytecnt != devc->byte_cnt)
-					sr_err("ERROR: received %lu and counted %lu bytecnts " \
+					sr_err("ERROR: received %llu and counted %llu bytecnts " \
 							"don't match, data may be lost",
 						rxbytecnt, devc->byte_cnt);
 
@@ -806,12 +806,12 @@ SR_PRIV int raspberrypi_pico_receive(int fd, int revents, void *cb_data)
 
 	if ((devc->sent_samples >= devc->limit_samples) \
 		&& (devc->rxstate == RX_ACTIVE)) {
-		sr_dbg("Ending: sent %u of limit %lu samples byte_cnt %lu",
+		sr_dbg("Ending: sent %u of limit %llu samples byte_cnt %llu",
 			devc->sent_samples, devc->limit_samples, devc->byte_cnt);
 		send_serial_char(serial, '+');
 	}
 
-	sr_spew("Receive function done: sent %u limit %lu wrptr %u len %d",
+	sr_spew("Receive function done: sent %u limit %llu wrptr %u len %d",
 		devc->sent_samples, devc->limit_samples, devc->wrptr, len);
 
 	return TRUE;

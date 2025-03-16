@@ -32,15 +32,24 @@
 // #define MRK_STRIDE 128
 
 /* Channel counts */
-#define CHANNEL_COUNT 8
-#define SAMPLE_SIZE   ((CHANNEL_COUNT+CHAR_BIT-1)/CHAR_BIT)
+enum {
+	SAMPLE_SIZE     = 1,                          // Number of Bytes per sample
+	CHANNEL_COUNT   = CHAR_BIT * SAMPLE_SIZE,     // Number of bits per sample
+	ROUND_COUNT     = sizeof(uint64_t),           // Atomic size of data from probe to host
+	ROUND_MASK      = (~(ROUND_COUNT-1)),         // Round down to atomic size multiple
+#ifndef UNIT_TEST
+	DATA_BLOCK_SIZE = 0x1000,                     // Size in bytes of the data blocks (also size of a RAM page)
+#else
+	DATA_BLOCK_SIZE = 0x20,
+#endif
+	DATA_WORD_COUNT = DATA_BLOCK_SIZE/ROUND_COUNT,  // Number of words in a data block
+	MARKER_SIZE     = ROUND_COUNT,                // Size of complete markers
+	BOB_LENGTH      = MARKER_SIZE / 2,            // BoB (beginning of Block) marker preceeds 32-byte block ID (little endian) and then 4096
+};
 
-#define ROUND_COUNT        8
-#define ROUND_MASK         (~(ROUND_COUNT-1))
-#define DATA_BLOCK_SIZE    0x8000L
-#define EOB_MARKER_SIZE    ROUND_COUNT
+
 /* Size of serial data buffer */
-#define SERIAL_BUFFER_SIZE (DATA_BLOCK_SIZE + EOB_MARKER_SIZE)
+#define SERIAL_BUFFER_SIZE (DATA_BLOCK_SIZE + MARKER_SIZE)
 
 
 typedef enum rxstate {
@@ -59,6 +68,12 @@ typedef enum bufferstatus {
 } bufferstatus_t;
 
 
+typedef union {
+	uint32_t words[ROUND_COUNT/sizeof(uint32_t)];
+	uint8_t  bytes[ROUND_COUNT];
+	uint64_t dword;
+} probe_to_host_t;
+
 
 struct dev_context {
 	/* Configuration Parameters
@@ -66,7 +81,7 @@ struct dev_context {
 	 * etc and do the right thing. i.e. don't expect continuous streaming
 	 * bandwidth greater than serial link speed etc... */
 	/* The number of samples the user expects to see. */
-	uint64_t limit_samples;
+	uint64_t limit_dwords;
 	uint64_t sample_rate;
 	/* Number of samples that have been received and processed */
 	uint32_t num_samples;
@@ -78,7 +93,7 @@ struct dev_context {
 	uint64_t capture_ratio;
 
 	/* Tracking/status once started */
-	/* Samples sent to the session */
+	/* Samples dwords sent to the session */
 	uint32_t sent_samples;
 	/* Buffer number to detect lost info */
 	uint32_t buffer_number;
@@ -90,6 +105,7 @@ struct dev_context {
 	 * start. */
 	gboolean trigger_fired;
 	gboolean pretrig_filled;
+	gboolean data_expected;
 	/* Keep previous sample value to check trigger change conditions */
 	uint8_t  previous_sample;
 	rxstate_t rxstate;
@@ -100,18 +116,19 @@ struct dev_context {
 	/* Size of incoming serial buffer*/
 	//uint32_t serial_buffer_size;
 	/* Current byte in serial read stream that is being processed */
-	uint32_t ser_rdptr;
-	/* Write pointer into the serial input buffer */
+	//uint32_t ser_rdptr;
+	/* Write pointer into the serial input buffer (in bytes) */
 	uint32_t wrptr;
 
 	/* Buffering Related */
 	/* Parsed serial read data is split into each channels dedicated buffer
 	 * for analog */
 	// float *a_data_bufs[MAX_ANALOG_CHANNELS];
+
 	/* Digital samples are stored packed together since cli/pulseview want it
 	 * that way */
 	uint8_t *d_data_buf;
-	/* Write pointer for the the per channel data buffers */
+	/* Write pointer for the per channel data buffers counting in bytes */
 	uint32_t cbuf_wrptr;
 	/* Size of packet data buffers for each channel */
 	//uint32_t sample_buf_size;
@@ -127,16 +144,27 @@ struct dev_context {
 	uint64_t mask_change; 
 	uint64_t expect_state;
 
-	/* Maximum number of entries to store pre-trigger */
+	/* Maximum number of entries to store pre-trigger (counting in dwords) */
 	uint32_t pretrig_entries;
 	uint32_t pretrig_wr_ptr;
-	uint8_t *pretrig_buf;
+	probe_to_host_t *pretrig_buf;
 };
 
+
+#ifdef __BIG_ENDIAN__
+	#define SWAP_TO_BIGENDIAN(x) (x)
+#else
+	#ifdef __x86_64__
+		#define SWAP_TO_BIGENDIAN(x) ({uint32_t y=(x); __asm__ ("bswap %1" : "=r"(y) : "0"(y) ); y;})
+	#else
+		#define SWAP_TO_BIGENDIAN(x) ({uint8_t b; uint32_t a=(x) uint8_t *p = (uint8_t*)&a; \
+									b = p[0]; p[0] = p[3]; p[3] = b; b = p[1]; p[1] = P[2]; p[2] = b; a;})
+	#endif
+#endif
+
 gboolean reset_rp_device(struct sr_serial_dev_inst *serial);
-gboolean send_rp_sample_rate(const struct sr_dev_inst *sdi);
 gboolean send_rp_start_capture(const struct sr_dev_inst *sdi);
-bufferstatus_t read_rp_data_block (struct sr_dev_inst *sdi);
-gboolean send_rp_stop_capture(struct sr_dev_inst *sdi);
+bufferstatus_t read_rp_data_block (const struct sr_dev_inst *sdi);
+gboolean send_rp_stop_capture(const struct sr_dev_inst *sdi, uint32_t block_limit);
 
 #endif

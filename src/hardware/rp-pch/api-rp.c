@@ -16,6 +16,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <assert.h>
 #include <config.h>
 #include <fcntl.h>
 #include <glib.h>
@@ -27,6 +28,13 @@
 #include <libsigrok/libsigrok.h>
 #include "libsigrok-internal.h"
 #include "protocol-rp.h"
+
+#ifndef UNIT_TEST
+#define RP_STATIC static
+#else
+#define RP_STATIC
+#endif
+
 
 /* Baud rate is really a don't care because we run USB CDC, dtr must be 1.
  * flow should be zero since we don't use xon/xoff */
@@ -91,10 +99,10 @@ static const uint32_t devopts[] = {
 
 static struct sr_dev_driver rp_pch_driver_info;
 
-static int check_trigger (struct dev_context *sdc, const uint8_t *buf, int len);
+static int check_trigger (struct dev_context *sdc, const probe_to_host_t *buf);
 
 
-static GSList *scan(struct sr_dev_driver *di, GSList * options)
+static GSList *rp_scan(struct sr_dev_driver *di, GSList * options)
 {
 	struct sr_config *src;
 	struct sr_dev_inst *sdi;
@@ -136,11 +144,11 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 		return NULL;
 	}
 
-   if (!reset_rp_device(serial)) {
+    if (!reset_rp_device(serial)) {
 		sr_err("Failed to reset serial probe");
 		serial_close(serial);
 		return NULL;
-   }
+    }
 
 	sdi = g_malloc0(sizeof(struct sr_dev_inst));
 	sdi->status = SR_ST_INACTIVE;
@@ -165,14 +173,14 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	}
 
 
-	devc->cbuf_wrptr = 0;
+	// devc->cbuf_wrptr = 0;
 
 	devc->d_data_buf = NULL;
 	devc->sample_rate = 5000;
 	devc->capture_ratio = 10;
 	devc->rxstate = RX_IDLE;
 	/*Set an initial value as various code relies on an inital value. */
-	devc->limit_samples = 1000;
+	devc->limit_dwords = 125;
 
 	sdi->priv = devc;
 
@@ -183,7 +191,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 
 /* Note that on the initial driver load we pull all values into local storage.
  * Thus gets can return local data, but sets have to issue commands to device. */
-static int config_set(uint32_t key, GVariant * data,
+static int rp_pch_config_set(uint32_t key, GVariant * data,
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
 	struct dev_context *devc;
@@ -203,8 +211,8 @@ static int config_set(uint32_t key, GVariant * data,
 		sr_dbg("config_set sr %" PRIu64 "\n", devc->sample_rate);
 		break;
 	case SR_CONF_LIMIT_SAMPLES:
-		devc->limit_samples = g_variant_get_uint64(data);
-		sr_dbg("config_set slimit %" PRIu64 "\n", devc->limit_samples);
+		devc->limit_dwords = (g_variant_get_uint64(data) + ROUND_COUNT - 1) / ROUND_COUNT * SAMPLE_SIZE;
+		sr_dbg("config_set dword limit %" PRIu64 "\n", devc->limit_dwords);
 		break;
 	case SR_CONF_CAPTURE_RATIO:
 		devc->capture_ratio = g_variant_get_uint64(data);
@@ -219,7 +227,7 @@ static int config_set(uint32_t key, GVariant * data,
 }
 
 
-static int config_get(uint32_t key, GVariant ** data,
+static int rp_pch_config_get(uint32_t key, GVariant ** data,
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
 	struct dev_context *devc;
@@ -244,8 +252,8 @@ static int config_get(uint32_t key, GVariant ** data,
 		*data = g_variant_new_uint64(devc->capture_ratio);
 		break;
 	case SR_CONF_LIMIT_SAMPLES:
-		sr_spew("config_get limit_samples of %" PRIu64, devc->limit_samples);
-		*data = g_variant_new_uint64(devc->limit_samples);
+		sr_spew("config_get limit_dwords of %" PRIu64, devc->limit_dwords);
+		*data = g_variant_new_uint64(devc->limit_dwords * ROUND_COUNT / SAMPLE_SIZE);
 		break;
 	default:
 		sr_spew("unsupported config_get key %d", key);
@@ -255,7 +263,7 @@ static int config_get(uint32_t key, GVariant ** data,
 }
 
 
-static int config_list(uint32_t key, GVariant ** data,
+static int rp_pch_config_list(uint32_t key, GVariant ** data,
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
 	(void) cg;
@@ -296,30 +304,43 @@ static int config_list(uint32_t key, GVariant ** data,
 }
 
 
-static void copy_to_pretrigger(struct dev_context *devc, int len) {
-	if (devc->pretrig_entries > 0) {
-		if ((uint32_t)len >= devc->pretrig_entries) {
-			//-- The buffer is more than sufficient to fill up the pretrigger
-			devc->pretrig_filled = TRUE;
-			devc->pretrig_wr_ptr = 0;
-			memcpy(devc->pretrig_buf, devc->d_data_buf + (len - devc->pretrig_entries), devc->pretrig_entries);
+static void copy_to_pretrigger(struct dev_context *devc, probe_to_host_t *data, int word_len) {
+	int buf_len = devc->pretrig_entries;
+	if ((uint32_t)word_len >= buf_len) {
+		//-- The buffer is more than sufficient to fill up the pretrigger
+		devc->pretrig_filled = TRUE;
+		devc->pretrig_wr_ptr = 0;
+		memcpy(devc->pretrig_buf, data + (word_len - buf_len), buf_len * ROUND_COUNT);
+		sr_err("End @%d of rcv data (%d dwords) to pretrig. %8x...%8x", word_len - buf_len, buf_len, 
+				SWAP_TO_BIGENDIAN(data[word_len - buf_len].words[0]), 
+				SWAP_TO_BIGENDIAN(data[buf_len-1].words[1]));
+	}
+	else if (word_len + devc->pretrig_wr_ptr >= buf_len) {
+		//-- Will cause the buffer to loop
+		//-- Copy first the first end to the end of the buffer
+		int first_part_len = buf_len - devc->pretrig_wr_ptr;
+		devc->pretrig_filled = TRUE;
+		memcpy((devc->pretrig_buf) + devc->pretrig_wr_ptr, data, first_part_len * ROUND_COUNT);
+		sr_err("start @%d for %d dwords up to end of pretrig. %8x...%8x", devc->pretrig_wr_ptr, first_part_len, 
+			SWAP_TO_BIGENDIAN(data[0].words[0]), 
+			SWAP_TO_BIGENDIAN(data[first_part_len-1].words[1]));
+		//-- Copy second part at beginning of the buffer
+		devc->pretrig_wr_ptr = word_len - first_part_len;
+		if (devc->pretrig_wr_ptr > 0) {
+			memcpy(devc->pretrig_buf, data + first_part_len, devc->pretrig_wr_ptr * ROUND_COUNT);
+			sr_err("Loop pretrig for %d dwords. %8x...%8x", devc->pretrig_wr_ptr, 
+				SWAP_TO_BIGENDIAN(data[first_part_len].words[0]), 
+				SWAP_TO_BIGENDIAN(data[word_len-1].words[1]));
 		}
-		else if (len + devc->pretrig_wr_ptr >= devc->pretrig_entries) {
-			//-- Will cause the buffer to loop
-			//-- Copy first the first end to the end of the buffer
-			int first_part_len = devc->pretrig_entries - devc->pretrig_wr_ptr;
-			devc->pretrig_filled = TRUE;
-			memcpy(devc->pretrig_buf + devc->pretrig_wr_ptr, devc->d_data_buf, first_part_len);
-			//-- Copy second part at beginning of the buffer
-			devc->pretrig_wr_ptr = len - first_part_len;
-			memcpy(devc->pretrig_buf, devc->d_data_buf + first_part_len, devc->pretrig_wr_ptr);
-		}
-		else {
-			// Too few data to overflow the buffer
-			// Simply copy the data
-			memcpy(devc->pretrig_buf + devc->pretrig_wr_ptr, devc->d_data_buf, len);
-			devc->pretrig_wr_ptr += len;
-		}
+	}
+	else {
+		// Too few data to fill the buffer
+		// Simply copy the data
+		memcpy(devc->pretrig_buf + devc->pretrig_wr_ptr, data, word_len * ROUND_COUNT);
+		sr_err("Add %d dwords to pretrig @%d. %8x...%8x", word_len, devc->pretrig_wr_ptr, 
+			SWAP_TO_BIGENDIAN(data[0].words[0]), 
+			SWAP_TO_BIGENDIAN(data[word_len-1].words[1]));
+		devc->pretrig_wr_ptr += word_len;
 	}
 }
 
@@ -349,7 +370,7 @@ static int rp_pch_receive(int fd, int revents, void *cb_data) {
 		/* This condition is normal operation and expected to happen
 		 * but printed as information */
 		sr_dbg("Reached non active state in receive %d", devc->rxstate);
-		/* Don't return - we may be waiting for a final bytecnt */
+		/* Don't return - we may be waiting for a final stop confirm */
 	}
 
 	if (devc->rxstate == RX_IDLE) {
@@ -367,25 +388,42 @@ static int rp_pch_receive(int fd, int revents, void *cb_data) {
 	bufferstatus_t status = read_rp_data_block(sdi);
 	switch (status) {
 		case BUFFER_RECEIVED:
+			probe_to_host_t *received_data = (probe_to_host_t*)devc->d_data_buf;
+
 			//-- Get packet ready to send the buffer
 			packet.type = SR_DF_LOGIC;
 			packet.payload = &logic;
 			/* The number of bytes required to fit all of the channels */
 			logic.unitsize = SAMPLE_SIZE;
+			logic.data     = devc->d_data_buf;
+			logic.length   = DATA_BLOCK_SIZE;
 
 			if (!devc->trigger_fired) {
 				//-- Not yet triggered
-				//-- Check if trigger has happen in received data
-				trigger_offset = check_trigger (devc, devc->d_data_buf, DATA_BLOCK_SIZE);
-				//-- Round trigger to dword
+				//-- Check if trigger has happen in received data (triggerred offset rounded to dword)
+				trigger_offset = check_trigger (devc, logic.data);
 				
 				if (trigger_offset >= 0) {
-					trigger_offset &= ROUND_MASK;
+
+					sr_err("Trigger cond met in buf %08x at dword offset %d", devc->buffer_number-1, trigger_offset);
+					sr_err("Words %8x %8x | %8x %8x | %8x %8x", 
+						SWAP_TO_BIGENDIAN(received_data[trigger_offset-1].words[0]), SWAP_TO_BIGENDIAN(received_data[trigger_offset-1].words[1]),
+						SWAP_TO_BIGENDIAN(received_data[trigger_offset].words[0]), SWAP_TO_BIGENDIAN(received_data[trigger_offset].words[1]), 
+						SWAP_TO_BIGENDIAN(received_data[trigger_offset+1].words[0]), SWAP_TO_BIGENDIAN(received_data[trigger_offset+1].words[1]));
 
 					//-- Trigger has been found within these samples
-					copy_to_pretrigger(devc, trigger_offset);
+					if (trigger_offset > 0) {
+						// only copy in the pre-trigger data, the data that are placed before the trigger event
+						copy_to_pretrigger(devc, received_data, trigger_offset);
+					}
 					devc->trigger_fired = TRUE;
-
+					int start_buffer = (devc->buffer_number-1) * DATA_WORD_COUNT + trigger_offset - devc->pretrig_entries;
+					if (start_buffer < 0) {
+						start_buffer = 0;
+					}
+					if (! send_rp_stop_capture(sdi, (start_buffer+devc->limit_dwords + DATA_WORD_COUNT - 1) / DATA_WORD_COUNT))
+						return FALSE;
+				
 					//-- If any pretrig data send them
 					if (devc->pretrig_filled || (devc->pretrig_wr_ptr > 0)) {
 						//-- Send pre-trigger buffer
@@ -393,41 +431,46 @@ static int rp_pch_receive(int fd, int revents, void *cb_data) {
 							devc->sent_samples = devc->pretrig_entries;
 							if (devc->pretrig_wr_ptr > 0) {
 								//-- Start first by the second part of the buffer since it has cycled
-								logic.length = devc->pretrig_entries - devc->pretrig_wr_ptr;
-								logic.data = devc->pretrig_buf + devc->pretrig_wr_ptr;
+								logic.data   = devc->pretrig_buf + devc->pretrig_wr_ptr;
+								logic.length = (devc->pretrig_entries - devc->pretrig_wr_ptr) * ROUND_COUNT;
+								sr_err("Send first part of pretrig @%d len=%d. %8x...%8x", devc->pretrig_wr_ptr, devc->pretrig_entries - devc->pretrig_wr_ptr,
+									SWAP_TO_BIGENDIAN(devc->pretrig_buf[devc->pretrig_wr_ptr].words[0]), 
+									SWAP_TO_BIGENDIAN(devc->pretrig_buf[devc->pretrig_entries-1].words[1]));
 								sr_session_send(sdi, &packet);
 							}
 						}
 						else {
 							devc->sent_samples = devc->pretrig_wr_ptr;
 						}
-						//-- Send beginning of the pretrig buffer
-						logic.length = (devc->pretrig_wr_ptr == 0) ? DATA_BLOCK_SIZE : devc->pretrig_wr_ptr;
-						logic.data = devc->pretrig_buf;
+						//-- Send beginning of the pretrig buffer (which is the second part of the pretrig data when it is filled)
+						logic.length = ((devc->pretrig_wr_ptr == 0) ? devc->pretrig_entries : devc->pretrig_wr_ptr) * ROUND_COUNT;
+						logic.data   = devc->pretrig_buf;
+						sr_err("Send end of pretrig len=%d. %8x...%8x", logic.length/ROUND_COUNT, 
+							SWAP_TO_BIGENDIAN(devc->pretrig_buf->words[0]), 
+							SWAP_TO_BIGENDIAN(devc->pretrig_buf[logic.length/ROUND_COUNT-1].words[1]));
 						sr_session_send(sdi, &packet);
 					}
 				}
 				else {
-					copy_to_pretrigger(devc, DATA_BLOCK_SIZE);
+					copy_to_pretrigger(devc, received_data, DATA_WORD_COUNT);
 				}
 			}
 
 			//-- Check again trigger status as it may have changed above
 			if (devc->trigger_fired) {
-				/* Update the count of data received with the new buffer */
-				len = DATA_BLOCK_SIZE - trigger_offset;
+				/* Update the count of data received with the new buffer to remove pretigger data if any */
+				len = DATA_WORD_COUNT - trigger_offset;
 				devc->sent_samples += len;
-				if (devc->sent_samples > devc->limit_samples) {
-					len -= (devc->sent_samples - devc->limit_samples);
-					devc->sent_samples = devc->limit_samples;
-					if (devc->rxstate == RX_ACTIVE) {
-						return sr_dev_acquisition_stop(sdi) == SR_OK;
-					}
+				if (devc->sent_samples > devc->limit_dwords) {
+					len -= (devc->sent_samples - devc->limit_dwords);
+					sr_err("More data received than needed %ld > %ld keep only %ld dwords", devc->sent_samples, devc->limit_dwords, len);
+					devc->sent_samples = devc->limit_dwords;
 				}
 				if (len > 0) {
 					/* The total length of the array sent */
-					logic.length = len;
-					logic.data = devc->d_data_buf + trigger_offset;
+					logic.length = len * ROUND_COUNT;
+					logic.data = received_data + trigger_offset;
+					sr_err("Loading %ld dwords (total=%ld)", len, devc->sent_samples);
 					sr_session_send(sdi, &packet);
 				}
 			}
@@ -435,11 +478,11 @@ static int rp_pch_receive(int fd, int revents, void *cb_data) {
 
 		case ACQ_COMPLETED: 
 			devc->rxstate = RX_IDLE;
-			break;
+			sr_session_stop(sdi->session);
+		break;
 
 		case INVALID_DATA:
 			devc->rxstate = RX_ABORT;
-			sdi->driver->dev_acquisition_stop(sdi);
 			return FALSE;
 
 		case PARTIAL_DATA:
@@ -450,7 +493,7 @@ static int rp_pch_receive(int fd, int revents, void *cb_data) {
 }
 
 
-static int dev_acquisition_start(const struct sr_dev_inst *sdi)
+static int rp_acquisition_start(const struct sr_dev_inst *sdi)
 {
 	struct sr_serial_dev_inst *serial;
 	struct dev_context *devc;
@@ -461,10 +504,12 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc = sdi->priv;
 	sr_dbg("Enter acq start");
 
-	devc->d_data_buf = g_malloc(SERIAL_BUFFER_SIZE);
-	if (!(devc->d_data_buf)) {
-		sr_err("ERROR: serial buffer malloc fail");
-		return SR_ERR_MALLOC;
+	if (devc->d_data_buf == NULL) {
+		devc->d_data_buf = g_malloc(DATA_BLOCK_SIZE);
+		if (!(devc->d_data_buf)) {
+			sr_err("ERROR: serial buffer malloc fail");
+			return SR_ERR_MALLOC;
+		}
 	}
 
 	/* Get device in idle state */
@@ -474,32 +519,17 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	}
 
 
-	if (! send_rp_sample_rate(sdi)) {
-		sr_err("Failed to set sample rate");
-		return SR_ERR;
-	}
+	// if (! send_rp_sample_rate(sdi)) {
+	// 	sr_err("Failed to set sample rate");
+	// 	return SR_ERR;
+	// }
 
 	devc->sent_samples = 0;
 	devc->buffer_number = 0;
 	devc->wrptr = 0;
-	devc->cbuf_wrptr = 0;
+	devc->data_expected = FALSE;
+	// devc->cbuf_wrptr = 0;
 
-	devc->d_data_buf = g_malloc(SERIAL_BUFFER_SIZE);
-	if (!(devc->d_data_buf)) {
-		sr_err("ERROR: logic buffer malloc fail");
-		return SR_ERR_MALLOC;
-	}
-
-	devc->trigger_fired = FALSE;
-	devc->pretrig_entries = (devc->capture_ratio * devc->limit_samples) / 100;
-	devc->pretrig_entries += ROUND_COUNT - 1;
-	devc->pretrig_entries &= ROUND_MASK;
-
-	if (devc->pretrig_entries > 0) {
-		devc->pretrig_buf = g_malloc(devc->pretrig_entries * SAMPLE_SIZE);
-		devc->pretrig_wr_ptr = 0;
-		devc->pretrig_filled = FALSE;
-	}
 	/* While the driver supports the passing of trigger info to the device
 	 * it has been found that the sw overhead of supporting triggering and
 	 * pretrigger buffer entries etc.. ends up slowing the cores down enough
@@ -512,8 +542,18 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->expect_state = 0;  // Default to 0
 	trigger = sr_session_trigger_get(sdi->session);
 	if (trigger) {
-		if (g_slist_length(trigger->stages) > 1)
+		if (g_slist_length(trigger->stages) > 1) {
 			return SR_ERR_NA;
+		}
+
+		devc->trigger_fired = FALSE;
+		devc->pretrig_entries = (devc->capture_ratio * devc->limit_dwords) / 100;
+	
+		if (devc->pretrig_entries > 0) {
+			devc->pretrig_buf = g_malloc(devc->pretrig_entries * SAMPLE_SIZE * ROUND_COUNT);
+			devc->pretrig_wr_ptr = 0;
+			devc->pretrig_filled = FALSE;
+		}
 
 		struct sr_trigger_stage *stage;
 		struct sr_trigger_match *match;
@@ -527,7 +567,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 				continue;
 			if (!match->channel->enabled)
 				continue;
-			int bit = 1 << match->channel->index;
+			uint64_t bit = 0x0101010101010101LL << match->channel->index;
 			switch(match->match) {
 			case SR_TRIGGER_ZERO:
 				devc->mask_state   |= bit;
@@ -552,21 +592,21 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 				break;
 			}
 		}
-		sr_info("Trigger value State %02llx %02llx Change %02llx", devc->expect_state, devc->mask_state, devc->mask_change);
+		sr_info("Trigger value State %02llx %02llx Change %02llx", devc->expect_state&0xFF, devc->mask_state&0xFF, devc->mask_change&0xFF);
 
 		devc->trigger_fired = FALSE;
 
 		sr_info("Entering sw triggered mode");
-		/* Post the receive before starting the device to ensure we are ready
-		 * to receive data ASAP */
-		serial_source_add(sdi->session, serial, G_IO_IN, 200, rp_pch_receive, (void*)sdi);
 
 	} else {
 		devc->trigger_fired = TRUE;
 		devc->pretrig_entries = 0;
 		sr_info("Entering fixed sample mode");
-		serial_source_add(sdi->session, serial, G_IO_IN, 200, rp_pch_receive, (void*)sdi);
 	}
+	
+	/* Post the receive before starting the device to ensure we are ready
+		* to receive data ASAP */
+	serial_source_add(sdi->session, serial, G_IO_IN, 200, rp_pch_receive, (void*)sdi);
 
 	if (!send_rp_start_capture(sdi)) {
 		return SR_ERR;
@@ -574,8 +614,10 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 
 	std_session_send_df_header(sdi);
 
-	if (devc->trigger_fired)
-		std_session_send_df_trigger(sdi);
+	if (devc->trigger_fired) {
+		if (! send_rp_stop_capture(sdi, (devc->limit_dwords + DATA_WORD_COUNT - 1) / DATA_WORD_COUNT))
+			return SR_ERR;
+	}
 
 	/* Keep this at the end as we don't want to be RX_ACTIVE unless everything
 	 * is ok */
@@ -596,39 +638,36 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 // state=1, change=1, expect=1 => cond: Raising
 // state=1, change=1, expect=0 => cond: Falling
 // state=0, change=0, expect=x => cond: don't care
-static int check_trigger (struct dev_context *sdc, const uint8_t *buf, int len) {
-	const uint64_t * const batch_buf = (uint64_t *)buf;
-	const int              batch_len = len / ROUND_COUNT;
+static int check_trigger (struct dev_context *sdc, const probe_to_host_t *buf) {
 	int       found       = -1;
 	int       cur_byte    = 0;
 
-	for (int i = 0; (i < batch_len) && (found < 0); ++i) {
+	for (int i = 0; (i < DATA_WORD_COUNT) && (found < 0); ++i) {
+		probe_to_host_t cur_dword = buf[i];
+		probe_to_host_t prev_dword;
 #ifdef __BIG_ENDIAN__
-		uint64_t prev_dword = buf[i];
-		uint8_t  swap       = last_dword & 0xFF;
-		last_dword &= ~0xFF;
-		last_dword |= prev;
-		prev = swap;
-		uint64_t last_dword = (last_dword << CHAR_BIT) || (last_dword >> BACK_ROL_COUNT);
+		prev_dword.dword = (cur_dword.dword >> CHAR_BIT);        // Scroll the bytes to the byte + 1 (on big endian increasing byte order scrolls right)
 #else
-		uint64_t cur_dword  = batch_buf[i];
-		uint64_t prev_dword = (cur_dword << CHAR_BIT) || (cur_dword >> BACK_ROL_COUNT);
-		uint8_t  swap       = prev_dword & 0xFF;
-		prev_dword &= ~0xFF;
-		prev_dword |= sdc->previous_sample;
-		sdc->previous_sample = swap;
+		prev_dword.dword = (cur_dword.dword << CHAR_BIT);        // Scroll the bytes to the byte + 1 (on little endian increasing byte order scrolls left)
 #endif
-		uint64_t match = ((sdc->expect_state ^ cur_dword) & sdc->mask_state) | ((sdc->previous_sample ^ cur_dword) & sdc->mask_change);
+		uint8_t  swap    = cur_dword.bytes[ROUND_COUNT-1];       // Save last byte to become previous byte of next dword
+		prev_dword.bytes[0] = sdc->previous_sample;              // Restore previous byte from byte saved at previous loop
+		sdc->previous_sample = swap;                             // Save previous byte of next samples
+
+		// Compute if trigerring condition is met in the 8 sample set
+		uint64_t match_state = ((sdc->expect_state ^ cur_dword.dword) & sdc->mask_state);
+		uint64_t match_change = ((~prev_dword.dword ^ cur_dword.dword) & sdc->mask_change);
+		uint64_t match = match_state | match_change;
 		for (int j = 0; j < ROUND_COUNT; j++, cur_byte++) {
 #ifdef __BIG_ENDIAN__
-			match = (match << CHAR_BIT) | (match >> BACK_ROL_COUNT);
+			match = (match << CHAR_BIT) | (match >> BACK_ROL_COUNT);  // In big endian first (and then next) bytes are highest weight so roll right to get them on lowest byte
 #endif
 			if ((match & 0xFF) == 0) {
-				found = cur_byte;
+				found = i;        // get first or next byte
 				break;
 			}
 #ifndef __BIG_ENDIAN__
-			match >>= CHAR_BIT;
+			match >>= CHAR_BIT;   // In little endian fist bytes was already the lowest, next is just above so shift right to get it
 #endif
 		}
 	}
@@ -639,7 +678,7 @@ static int check_trigger (struct dev_context *sdc, const uint8_t *buf, int len) 
  * samples or an error condition, and also by the user clicking stop in
  * pulseview. It must always be called for any acquistion that was started to
  * free memory. */
-static int dev_acquisition_stop(struct sr_dev_inst *sdi)
+static int rp_acquisition_stop(struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	struct sr_serial_dev_inst *serial;
@@ -651,11 +690,6 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 
 	std_session_send_df_end(sdi);
 
-	if (devc->rxstate != RX_IDLE) {
-		if (!send_rp_stop_capture(sdi)) {
-			sr_err("Failed sending plus to stop device stream");
-		}
-	}
 	devc->rxstate = RX_IDLE;
 
 	/* Drain data from device so that it doesn't confuse subsequent commands */
@@ -665,16 +699,18 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 			sr_err("Dropping %d device bytes", len);
 	} while (len > 0);
 
+	// serial_source_remove(sdi->session, serial);
+
+	// sr_serial_dev_inst_free(sdi->conn);
+	
 	if (devc->d_data_buf) {
 		g_free(devc->d_data_buf);
 		devc->d_data_buf = NULL;
 	}
-
-	sr_serial_dev_inst_free(sdi->conn);
-	
-	sr_session_stop(sdi->session);
-
-	serial_source_remove(sdi->session, serial);
+	if (devc->pretrig_buf) {
+		g_free(devc->pretrig_buf);
+		devc->pretrig_buf = NULL;
+	}
 
 	return SR_OK;
 }
@@ -685,16 +721,16 @@ static struct sr_dev_driver rp_pch_driver_info = {
 	.api_version = 1,
 	.init = std_init,
 	.cleanup = std_cleanup,
-	.scan = scan,
+	.scan = rp_scan,
 	.dev_list = std_dev_list,
 	.dev_clear = std_dev_clear,
-	.config_get = config_get,
-	.config_set = config_set,
-	.config_list = config_list,
+	.config_get = rp_pch_config_get,
+	.config_set = rp_pch_config_set,
+	.config_list = rp_pch_config_list,
 	.dev_open = std_serial_dev_open,
 	.dev_close = std_serial_dev_close,
-	.dev_acquisition_start = dev_acquisition_start,
-	.dev_acquisition_stop = dev_acquisition_stop,
+	.dev_acquisition_start = rp_acquisition_start,
+	.dev_acquisition_stop = rp_acquisition_stop,
 	.context = NULL,
 };
 
