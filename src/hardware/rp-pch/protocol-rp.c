@@ -204,9 +204,10 @@ gboolean reset_rp_device(struct sr_serial_dev_inst *serial)
         };
         // This trial is completed (successfully or not)
         ++trials;
+        sr_warn("Drain read status=%d (%d/10)", result, trials);
     }
     // Retry a new time if we have not been successfull or if retry limit has been reached
-    while (!result && (trials < 5));
+    while (!result || (trials < 10));
     sr_warn("Drain reads done");
     return result;
 }
@@ -234,7 +235,7 @@ static gboolean send_rp_command(const struct sr_dev_inst *sdi, const char *comma
         sr_err("Failed to send probe %s acquisition command", tmpstr);
         return FALSE;
     }
-
+    sr_warn("Cmd: %s", tmpstr);
     return TRUE;
 }
 
