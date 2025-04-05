@@ -306,7 +306,7 @@ static int rp_pch_config_list(uint32_t key, GVariant ** data,
 
 static void copy_to_pretrigger(struct dev_context *devc, probe_to_host_t *data, int word_len) {
 	int buf_len = devc->pretrig_entries;
-	if ((uint32_t)word_len >= buf_len) {
+	if (word_len >= buf_len) {
 		//-- The buffer is more than sufficient to fill up the pretrigger
 		devc->pretrig_filled = TRUE;
 		devc->pretrig_wr_ptr = 0;
@@ -315,7 +315,7 @@ static void copy_to_pretrigger(struct dev_context *devc, probe_to_host_t *data, 
 				SWAP_TO_BIGENDIAN(data[word_len - buf_len].words[0]), 
 				SWAP_TO_BIGENDIAN(data[buf_len-1].words[1]));
 	}
-	else if (word_len + devc->pretrig_wr_ptr >= buf_len) {
+	else if (word_len + (int)devc->pretrig_wr_ptr >= buf_len) {
 		//-- Will cause the buffer to loop
 		//-- Copy first the first end to the end of the buffer
 		int first_part_len = buf_len - devc->pretrig_wr_ptr;
@@ -445,7 +445,7 @@ static int rp_pch_receive(int fd, int revents, void *cb_data) {
 						//-- Send beginning of the pretrig buffer (which is the second part of the pretrig data when it is filled)
 						logic.length = ((devc->pretrig_wr_ptr == 0) ? devc->pretrig_entries : devc->pretrig_wr_ptr) * ROUND_COUNT;
 						logic.data   = devc->pretrig_buf;
-						sr_err("Send end of pretrig len=%d. %8x...%8x", logic.length/ROUND_COUNT, 
+						sr_err("Send end of pretrig len=%lld. %8x...%8x", logic.length/ROUND_COUNT, 
 							SWAP_TO_BIGENDIAN(devc->pretrig_buf->words[0]), 
 							SWAP_TO_BIGENDIAN(devc->pretrig_buf[logic.length/ROUND_COUNT-1].words[1]));
 						sr_session_send(sdi, &packet);
@@ -463,14 +463,14 @@ static int rp_pch_receive(int fd, int revents, void *cb_data) {
 				devc->sent_samples += len;
 				if (devc->sent_samples > devc->limit_dwords) {
 					len -= (devc->sent_samples - devc->limit_dwords);
-					sr_err("More data received than needed %ld > %ld keep only %ld dwords", devc->sent_samples, devc->limit_dwords, len);
+					sr_err("More data received than needed %d > %lld keep only %d dwords", devc->sent_samples, devc->limit_dwords, len);
 					devc->sent_samples = devc->limit_dwords;
 				}
 				if (len > 0) {
 					/* The total length of the array sent */
 					logic.length = len * ROUND_COUNT;
 					logic.data = received_data + trigger_offset;
-					sr_err("Loading %ld dwords (total=%ld)", len, devc->sent_samples);
+					sr_err("Loading %d dwords (total=%u)", len, devc->sent_samples);
 					sr_session_send(sdi, &packet);
 				}
 			}
